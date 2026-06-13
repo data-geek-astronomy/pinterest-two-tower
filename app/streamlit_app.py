@@ -1,32 +1,26 @@
 """
-Streamlit Demo: Pinterest Two-Tower Retrieval
+Pinterest Two-Tower Retrieval — Streamlit Demo
+Auto-generates data and trains a demo model on first run.
 
-Run:
-    streamlit run app/streamlit_app.py
+Run locally:  streamlit run app/streamlit_app.py
+Deploy:       push to GitHub → connect on share.streamlit.io
 """
 
 import sys
+import os
 import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
-import faiss
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# ── path setup ────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-from models.two_tower import build_model
-from inference.faiss_index import load_faiss_index, search_index
-
-# ─── Page Config ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Pinterest Two-Tower Retrieval",
-    page_icon="📌",
-    layout="wide",
-)
+CONFIG_PATH = str(ROOT / "demo_config.yaml")
 
 CATEGORIES = [
     "home_decor", "fashion", "food_recipes", "travel", "fitness",
@@ -48,294 +42,457 @@ CATEGORY_EMOJIS = {
     "movies": "🎬", "skincare": "🧴",
 }
 
+# ─── Page Config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Pinterest Two-Tower Retrieval",
+    page_icon="📌",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ─── Load Artifacts ───────────────────────────────────────────────────────────
-@st.cache_resource
-def load_artifacts():
-    import yaml
-    with open("config.yaml") as f:
+# ─── Custom CSS ───────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(135deg, #e60023 0%, #ad081b 100%);
+        padding: 1.5rem 2rem;
+        border-radius: 12px;
+        color: white;
+        margin-bottom: 1.5rem;
+    }
+    .metric-card {
+        background: #f8f9fa;
+        border-left: 4px solid #e60023;
+        padding: 0.8rem 1rem;
+        border-radius: 6px;
+        margin: 0.3rem 0;
+    }
+    .stProgress .st-bo { background-color: #e60023; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─── Auto-Setup Pipeline ──────────────────────────────────────────────────────
+
+def run_setup(cfg: dict, status_container):
+    """Generate data + train model if artifacts don't exist."""
+    import torch
+    import faiss as _faiss
+    from data.generate_data import main as gen_data
+    from pipeline.dataset import build_dataloaders
+    from models.two_tower import build_model, InfoNCELoss, HardNegativeMiner
+    import torch.optim as optim
+    from tqdm import tqdm
+
+    model_path = Path(cfg["paths"]["model_dir"]) / "best_model.pt"
+
+    with status_container.status("🚀 Setting up demo (first run only — ~2-3 min)...", expanded=True) as s:
+
+        # Step 1: Generate data
+        st.write("📦 Generating synthetic Pinterest dataset...")
+        gen_data(CONFIG_PATH)
+        st.write("✅ Dataset ready: 2,000 users · 8,000 pins · 30 categories")
+
+        # Step 2: Build data loaders
+        st.write("⚙️ Engineering features & building data pipeline...")
+        train_loader, val_loader, _, meta = build_dataloaders(cfg)
+        st.write(f"✅ Pipeline ready | user_dim={meta['user_feat_dim']} · item_dim={meta['item_feat_dim']}")
+
+        # Step 3: Train
+        device = torch.device("cpu")
+        model = build_model(cfg, meta["user_feat_dim"], meta["item_feat_dim"]).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=cfg["training"]["learning_rate"])
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg["training"]["epochs"])
+        criterion = InfoNCELoss()
+        miner = HardNegativeMiner(cfg["training"]["hard_negative_ratio"])
+
+        st.write(f"🧠 Training Two-Tower model ({model.num_parameters():,} params)...")
+        prog = st.progress(0)
+        history = {"train_loss": [], "val_recall@10": [], "val_ndcg@10": []}
+        best_recall = 0.0
+
+        for epoch in range(1, cfg["training"]["epochs"] + 1):
+            model.train()
+            total_loss = 0.0
+            for user_feats, item_feats, weights in train_loader:
+                u_emb, i_emb = model(user_feats.to(device), item_feats.to(device))
+                loss = criterion(u_emb, i_emb, model.temperature, weights.to(device))
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+            scheduler.step()
+
+            avg_loss = total_loss / len(train_loader)
+            history["train_loss"].append(avg_loss)
+            history["val_recall@10"].append(0.0)
+            history["val_ndcg@10"].append(0.0)
+
+            prog.progress(epoch / cfg["training"]["epochs"],
+                          text=f"Epoch {epoch}/{cfg['training']['epochs']} · loss={avg_loss:.4f}")
+
+        st.write(f"✅ Training complete! Final loss: {history['train_loss'][-1]:.4f}")
+
+        # Step 4: Build FAISS index
+        st.write("🗂️ Building FAISS index for fast retrieval...")
+        model.eval()
+        item_t = torch.from_numpy(meta["item_features"])
+        all_embs = []
+        with torch.no_grad():
+            for start in range(0, len(item_t), 512):
+                emb = model.encode_items(item_t[start:start+512])
+                all_embs.append(emb.numpy())
+        item_embs = np.vstack(all_embs).astype(np.float32)
+
+        dim = item_embs.shape[1]
+        index = _faiss.IndexFlatIP(dim)
+        index.add(item_embs)
+
+        Path(cfg["paths"]["model_dir"]).mkdir(parents=True, exist_ok=True)
+        _faiss.write_index(index, cfg["paths"]["index_path"])
+        np.save(cfg["paths"]["embeddings_path"], item_embs)
+
+        torch.save({
+            "model_state": model.state_dict(),
+            "meta": {"user_feat_dim": meta["user_feat_dim"], "item_feat_dim": meta["item_feat_dim"]},
+            "cfg": cfg,
+        }, model_path)
+
+        hist_path = Path(cfg["paths"]["model_dir"]) / "training_history.json"
+        with open(hist_path, "w") as f:
+            json.dump(history, f)
+
+        st.write("✅ FAISS index built & saved")
+        s.update(label="✅ Demo ready!", state="complete", expanded=False)
+
+    return model, index, item_embs, meta, history
+
+
+@st.cache_resource(show_spinner=False)
+def load_everything():
+    import yaml, torch, faiss as _faiss
+    from pipeline.dataset import build_dataloaders
+
+    with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
 
     model_path = Path(cfg["paths"]["model_dir"]) / "best_model.pt"
-    if not model_path.exists():
-        return None, None, None, None, None, cfg
-
-    ckpt = torch.load(model_path, map_location="cpu")
-    meta_dims = ckpt["meta"]
-    model = build_model(cfg, meta_dims["user_feat_dim"], meta_dims["item_feat_dim"])
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-
-    index = load_faiss_index(cfg["paths"]["index_path"], nprobe=cfg["faiss"]["nprobe"])
-    item_embs = np.load(cfg["paths"]["embeddings_path"])
-
-    # Load user and pin data
-    user_df = pd.read_parquet("data/raw/users.parquet")
-    pin_df = pd.read_parquet("data/raw/pins.parquet")
-
-    # Load history for training history chart
     hist_path = Path(cfg["paths"]["model_dir"]) / "training_history.json"
-    history = json.load(open(hist_path)) if hist_path.exists() else None
 
-    return model, index, item_embs, user_df, pin_df, cfg, history
+    status_box = st.empty()
+
+    if not model_path.exists():
+        model, index, item_embs, meta, history = run_setup(cfg, status_box)
+        status_box.empty()
+    else:
+        from models.two_tower import build_model
+        ckpt = torch.load(model_path, map_location="cpu")
+        m = ckpt["meta"]
+        model = build_model(cfg, m["user_feat_dim"], m["item_feat_dim"])
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+
+        index = _faiss.read_index(cfg["paths"]["index_path"])
+        item_embs = np.load(cfg["paths"]["embeddings_path"])
+
+        _, _, _, meta = build_dataloaders(cfg)
+        history = json.load(open(hist_path)) if hist_path.exists() else None
+
+    user_df = pd.read_parquet(Path(cfg["paths"]["data_dir"]) / "raw/users.parquet")
+    pin_df = pd.read_parquet(Path(cfg["paths"]["data_dir"]) / "raw/pins.parquet")
+
+    return model, index, item_embs, meta, user_df, pin_df, cfg, history
 
 
-def build_user_feature(user_row, interactions_agg, cfg):
-    """Reconstruct a user feature vector for the demo."""
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def build_user_feat(user_row, cfg):
     num_cat = cfg["data"]["num_categories"]
     cat_names = CATEGORIES[:num_cat]
-
-    interest_vals = [user_row.get(f"interest_{c}", 0.0) for c in cat_names]
-    behavior_vals = [
-        interactions_agg.get("total_interactions", 0),
-        interactions_agg.get("total_saves", 0),
-        interactions_agg.get("total_clicks", 0),
-        interactions_agg.get("total_closeups", 0),
-        interactions_agg.get("avg_weight", 0),
-        interactions_agg.get("unique_pins", 0),
-    ]
+    interest_vals = [float(user_row.get(f"interest_{c}", 0.0)) for c in cat_names]
+    behavior_vals = [0.0] * 6
     meta_vals = [
         float(user_row.get("account_age_days", 0)) / 2000,
         float(user_row.get("num_boards", 0)) / 50,
         float(user_row.get("num_pins_saved", 0)) / 5000,
         float(user_row.get("is_mobile", 0)),
     ]
-
     return np.array(interest_vals + behavior_vals + meta_vals, dtype=np.float32)
 
 
-# ─── UI ───────────────────────────────────────────────────────────────────────
-st.title("📌 Pinterest Two-Tower Retrieval Demo")
-st.caption("ML Engineer Interview Project · AK · 2024")
+def do_retrieval(model, index, user_feat, top_k):
+    import torch
+    model.eval()
+    with torch.no_grad():
+        u_t = torch.from_numpy(user_feat[np.newaxis, :])
+        u_emb = model.encode_users(u_t).numpy().astype(np.float32)
+    scores, ids = index.search(u_emb, top_k)
+    return scores[0], ids[0], u_emb[0]
 
-result = load_artifacts()
-if len(result) == 7:
-    model, index, item_embs, user_df, pin_df, cfg, history = result
-else:
-    model, index, item_embs, user_df, pin_df, cfg = result
-    history = None
 
-if model is None:
-    st.error(
-        "⚠️ No trained model found. Run `python scripts/train.py --regenerate-data` first."
-    )
-    st.stop()
+# ─── Main UI ─────────────────────────────────────────────────────────────────
 
-# ─── Sidebar: controls ───────────────────────────────────────────────────────
+st.markdown("""
+<div class="main-header">
+    <h1 style="margin:0; font-size:1.8rem;">📌 Pinterest Two-Tower Retrieval</h1>
+    <p style="margin:0.3rem 0 0 0; opacity:0.9;">
+        ML Engineer Interview Project · Dual Encoder · FAISS ANN · InfoNCE Loss
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+with st.spinner("Loading model..."):
+    model, index, item_embs, meta, user_df, pin_df, cfg, history = load_everything()
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Retrieval Settings")
+    st.markdown("### ⚙️ Retrieval Settings")
     top_k = st.slider("Top-K results", 5, 50, 20)
-    nprobe = st.slider(
-        "FAISS nprobe (speed ↔ recall)",
-        1, 50, cfg["faiss"]["nprobe"],
-        help="Higher = more accurate but slower. Tradeoff central to ANN retrieval."
-    )
-    index.nprobe = nprobe
+    nprobe_val = st.slider("FAISS nprobe", 1, 20, 5,
+                           help="Higher = better recall, slower query")
+    try:
+        index.nprobe = nprobe_val
+    except Exception:
+        pass
 
     st.divider()
-    st.header("👤 Select User")
-    user_id = st.number_input(
-        "User ID", min_value=0,
-        max_value=cfg["data"]["num_users"] - 1,
-        value=42
-    )
+    st.markdown("### 👤 Select User")
+    max_uid = cfg["data"]["num_users"] - 1
+    user_id = st.number_input("User ID", min_value=0, max_value=max_uid, value=42)
 
     st.divider()
-    st.header("🎨 Or Custom Interest Profile")
-    use_custom = st.checkbox("Build custom user profile")
+    st.markdown("### 🎨 Custom Interest Profile")
+    use_custom = st.toggle("Build custom user")
     custom_interests = {}
     if use_custom:
-        st.caption("Adjust interest weights (will sum-normalize):")
-        for cat in CATEGORIES[:cfg["data"]["num_categories"]]:
-            custom_interests[cat] = st.slider(
-                f"{CATEGORY_EMOJIS.get(cat, '')} {cat}", 0.0, 1.0, 0.0, step=0.05
-            )
+        st.caption("Set interest weights:")
+        num_cat = cfg["data"]["num_categories"]
+        for cat in CATEGORIES[:num_cat]:
+            emoji = CATEGORY_EMOJIS.get(cat, "")
+            custom_interests[cat] = st.slider(f"{emoji} {cat}", 0.0, 1.0, 0.0, step=0.1)
 
-# ─── Main Panel ──────────────────────────────────────────────────────────────
-tabs = st.tabs(["🔍 Retrieval", "📊 Training Curves", "🏗️ Architecture"])
+    st.divider()
+    st.markdown("### 📊 Model Stats")
+    st.markdown(f"""
+    <div class="metric-card">👥 Users: <b>{cfg['data']['num_users']:,}</b></div>
+    <div class="metric-card">📌 Pins: <b>{cfg['data']['num_pins']:,}</b></div>
+    <div class="metric-card">🏷️ Categories: <b>{cfg['data']['num_categories']}</b></div>
+    <div class="metric-card">🧠 Embed dim: <b>{cfg['model']['embedding_dim']}</b></div>
+    <div class="metric-card">⚡ Index: <b>FAISS Flat ({index.ntotal:,} vecs)</b></div>
+    """, unsafe_allow_html=True)
 
-# ── Tab 1: Retrieval ─────────────────────────────────────────────────────────
-with tabs[0]:
-    col1, col2 = st.columns([1, 2])
+# ─── Tabs ─────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🔍 Retrieval", "📊 Training Curves", "🏗️ Architecture", "🧪 Embedding Space"]
+)
 
-    with col1:
-        st.subheader("User Profile")
+# ─── Tab 1: Retrieval ─────────────────────────────────────────────────────────
+with tab1:
+    num_cat = cfg["data"]["num_categories"]
 
-        if use_custom:
-            total = sum(custom_interests.values()) or 1.0
-            interests = {k: v / total for k, v in custom_interests.items()}
-            user_feat = np.array(
-                [interests[c] for c in CATEGORIES[:cfg["data"]["num_categories"]]]
-                + [0] * 10,  # zero behavioral features for custom user
-                dtype=np.float32,
-            )
-        else:
-            user_row = user_df[user_df["user_id"] == user_id].iloc[0].to_dict()
-            user_feat = build_user_feature(user_row, {}, cfg)
-            interests = {
-                c: user_row.get(f"interest_{c}", 0.0)
-                for c in CATEGORIES[:cfg["data"]["num_categories"]]
-            }
+    if use_custom:
+        total = sum(custom_interests.values()) or 1.0
+        norm = {k: v / total for k, v in custom_interests.items()}
+        user_feat = np.array(
+            [norm.get(c, 0.0) for c in CATEGORIES[:num_cat]] + [0.0] * 10,
+            dtype=np.float32,
+        )
+        interests = norm
+        display_name = "Custom User"
+    else:
+        row = user_df[user_df["user_id"] == user_id].iloc[0].to_dict()
+        user_feat = build_user_feat(row, cfg)
+        interests = {c: float(row.get(f"interest_{c}", 0.0)) for c in CATEGORIES[:num_cat]}
+        display_name = f"User #{user_id}"
 
-        # Show top interests
+    scores, item_ids, u_emb = do_retrieval(model, index, user_feat, top_k)
+
+    col_left, col_right = st.columns([1, 2], gap="large")
+
+    with col_left:
+        st.subheader(f"👤 {display_name}")
+
         top_interests = sorted(interests.items(), key=lambda x: x[1], reverse=True)[:6]
         st.markdown("**Top interests:**")
         for cat, val in top_interests:
-            if val > 0.01:
+            if val > 0.005:
                 emoji = CATEGORY_EMOJIS.get(cat, "")
-                st.progress(float(val), text=f"{emoji} {cat}: {val:.2%}")
+                st.progress(float(val), text=f"{emoji} {cat}  ({val:.1%})")
 
-        # Interest distribution chart
         fig, ax = plt.subplots(figsize=(4, 3))
-        cats = [c for c, _ in top_interests]
-        vals = [v for _, v in top_interests]
-        bars = ax.barh(cats, vals, color="#e60023")
+        cats_plot = [CATEGORY_EMOJIS.get(c, "") + " " + c for c, _ in top_interests if _ > 0.005]
+        vals_plot = [v for _, v in top_interests if v > 0.005]
+        ax.barh(cats_plot, vals_plot, color="#e60023", alpha=0.85)
         ax.set_xlabel("Interest weight")
-        ax.set_xlim(0, max(vals) * 1.2)
         ax.invert_yaxis()
+        ax.spines[["top", "right"]].set_visible(False)
         fig.tight_layout()
-        st.pyplot(fig)
+        st.pyplot(fig, use_container_width=True)
 
-    with col2:
-        st.subheader(f"Top-{top_k} Retrieved Pins")
+    with col_right:
+        st.subheader(f"🔍 Top-{top_k} Retrieved Pins")
 
-        # Encode user + search
-        with torch.no_grad():
-            u_tensor = torch.from_numpy(user_feat[np.newaxis, :]).to("cpu")
-            u_emb = model.encode_users(u_tensor).numpy()
-
-        scores, item_ids = search_index(index, u_emb, top_k)
-        scores = scores[0]
-        item_ids = item_ids[0]
-
-        # Build results table
         results = []
         for rank, (iid, score) in enumerate(zip(item_ids, scores)):
-            if iid < len(pin_df):
-                pin_row = pin_df.iloc[int(iid)]
+            if 0 <= int(iid) < len(pin_df):
+                pr = pin_df.iloc[int(iid)]
                 results.append({
                     "Rank": rank + 1,
                     "Pin ID": int(iid),
-                    "Category": f"{CATEGORY_EMOJIS.get(pin_row['primary_category'], '')} {pin_row['primary_category']}",
-                    "Similarity": f"{score:.4f}",
-                    "Saves": f"{int(pin_row['num_saves']):,}",
-                    "Promoted": "✓" if pin_row["is_promoted"] else "",
+                    "Category": f"{CATEGORY_EMOJIS.get(pr['primary_category'], '')} {pr['primary_category']}",
+                    "Similarity": round(float(score), 4),
+                    "Saves": f"{int(pr['num_saves']):,}",
+                    "Promoted": "✓" if pr["is_promoted"] else "",
                 })
 
-        results_df = pd.DataFrame(results)
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
-        # Category distribution of retrieved pins
-        cats_retrieved = [r["Category"].split(" ", 1)[-1] for r in results]
-        cat_counts = pd.Series(cats_retrieved).value_counts()
+        # Category breakdown
+        cat_counts = pd.Series(
+            [r["Category"].split(" ", 1)[-1] for r in results]
+        ).value_counts()
 
-        fig2, ax2 = plt.subplots(figsize=(6, 3))
-        cat_counts.plot(kind="bar", ax=ax2, color="#e60023", alpha=0.85)
-        ax2.set_title("Category distribution of retrieved pins")
+        fig2, ax2 = plt.subplots(figsize=(7, 3))
+        cat_counts.plot(kind="bar", ax=ax2, color="#e60023", alpha=0.85, width=0.7)
+        ax2.set_title("Category distribution in retrieved pins", fontweight="bold")
         ax2.set_xlabel("")
         ax2.tick_params(axis="x", rotation=45)
+        ax2.spines[["top", "right"]].set_visible(False)
         fig2.tight_layout()
-        st.pyplot(fig2)
+        st.pyplot(fig2, use_container_width=True)
 
-        # Embedding similarity heatmap (user vs top-5 items)
-        st.subheader("Embedding Space Visualization")
-        top5_embs = item_embs[item_ids[:5]]
-        sim_matrix = np.vstack([u_emb, top5_embs]) @ np.vstack([u_emb, top5_embs]).T
-        labels = ["User"] + [f"Pin#{i+1}" for i in range(5)]
+# ─── Tab 2: Training Curves ───────────────────────────────────────────────────
+with tab2:
+    st.subheader("📈 Training History")
+    if history and history.get("train_loss"):
+        epochs_x = list(range(1, len(history["train_loss"]) + 1))
 
-        fig3, ax3 = plt.subplots(figsize=(5, 4))
-        sns.heatmap(
-            sim_matrix, annot=True, fmt=".2f", cmap="RdYlGn",
-            xticklabels=labels, yticklabels=labels, ax=ax3,
-            vmin=-1, vmax=1
-        )
-        ax3.set_title("Cosine similarity matrix (user + top-5 pins)")
-        fig3.tight_layout()
-        st.pyplot(fig3)
-
-# ── Tab 2: Training Curves ───────────────────────────────────────────────────
-with tabs[1]:
-    if history:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-        epochs = list(range(1, len(history["train_loss"]) + 1))
-        ax1.plot(epochs, history["train_loss"], color="#e60023", linewidth=2)
-        ax1.set_title("Training Loss (InfoNCE)")
-        ax1.set_xlabel("Epoch")
-        ax1.set_ylabel("Loss")
-        ax1.grid(alpha=0.3)
-
-        ax2.plot(epochs, history["val_recall@10"], label="Recall@10",
-                 color="#e60023", linewidth=2)
-        ax2.plot(epochs, history["val_ndcg@10"], label="NDCG@10",
-                 color="#0076d3", linewidth=2, linestyle="--")
-        ax2.set_title("Validation Metrics")
-        ax2.set_xlabel("Epoch")
-        ax2.set_ylabel("Score")
-        ax2.legend()
-        ax2.grid(alpha=0.3)
-
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(epochs_x, history["train_loss"], color="#e60023", linewidth=2.5,
+                marker="o", markersize=4, label="Train Loss (InfoNCE)")
+        ax.set_title("InfoNCE Training Loss", fontweight="bold")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        ax.spines[["top", "right"]].set_visible(False)
         fig.tight_layout()
-        st.pyplot(fig)
+        st.pyplot(fig, use_container_width=True)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Best Recall@10", f"{max(history['val_recall@10']):.4f}")
-        col2.metric("Best NDCG@10", f"{max(history['val_ndcg@10']):.4f}")
-        col3.metric("Min Train Loss", f"{min(history['train_loss']):.4f}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Min Loss", f"{min(history['train_loss']):.4f}")
+        c2.metric("Epochs Trained", len(history["train_loss"]))
+        c3.metric("Embedding Dim", cfg["model"]["embedding_dim"])
+
+        st.info(
+            "💡 **What InfoNCE loss means:** For each user in a batch, "
+            "the model pushes their embedding close to their saved pin and away from all "
+            "other pins in the batch (in-batch negatives). Lower loss = tighter, "
+            "more separated clusters in embedding space."
+        )
     else:
-        st.info("Train the model first to see learning curves.")
+        st.info("Train the model to see learning curves.")
 
-# ── Tab 3: Architecture ──────────────────────────────────────────────────────
-with tabs[2]:
-    st.subheader("Two-Tower Architecture")
-    st.markdown("""
-    ```
-    ┌──────────────────────────────────────────────────┐
-    │              TWO-TOWER MODEL                      │
-    │                                                   │
-    │  User Features (64-dim)    Item Features (164-dim)│
-    │         │                         │               │
-    │    ┌────▼────┐               ┌────▼────┐         │
-    │    │  MLP    │               │  MLP    │         │
-    │    │256→128  │               │256→128  │         │
-    │    │LayerNorm│               │LayerNorm│         │
-    │    │  GELU   │               │  GELU   │         │
-    │    │Dropout  │               │Dropout  │         │
-    │    └────┬────┘               └────┬────┘         │
-    │         │                         │               │
-    │    ┌────▼──────────embedding───────▼────┐        │
-    │    │        Shared Space (64-dim)        │        │
-    │    │     L2-Normalized embeddings        │        │
-    │    └─────────────────────────────────────┘        │
-    │                     │                             │
-    │            InfoNCE Loss (τ learnable)             │
-    │         In-batch negatives (B-1 per sample)      │
-    └──────────────────────────────────────────────────┘
+# ─── Tab 3: Architecture ──────────────────────────────────────────────────────
+with tab3:
+    st.subheader("🏗️ Two-Tower Architecture")
 
-    Inference:
-    ┌────────────┐     ┌─────────────────┐     ┌────────────────┐
-    │ User query │────▶│  User Tower     │────▶│ FAISS IVFFlat  │
-    │ (features) │     │ (encode online) │     │ ANN Search     │
-    └────────────┘     └─────────────────┘     └───────┬────────┘
-                                                        │
-                       ┌─────────────────┐             │
-                       │ Item embeddings │◀────────────┘
-                       │ (pre-computed,  │
-                       │  indexed in     │
-                       │  FAISS)         │
-                       └─────────────────┘
-    ```
-    """)
+    st.code("""
+  User Features (64-dim)          Item Features (164-dim)
+         │                                │
+   ┌─────▼──────┐                  ┌─────▼──────┐
+   │  User MLP  │                  │  Item MLP  │
+   │  128 → 64  │                  │  128 → 64  │
+   │ LayerNorm  │                  │ LayerNorm  │
+   │    GELU    │                  │    GELU    │
+   │  Dropout   │                  │  Dropout   │
+   └─────┬──────┘                  └─────┬──────┘
+         │                                │
+         └──────────┐  ┌─────────────────┘
+                    ▼  ▼
+             Shared Embedding Space (64-dim)
+                 L2-Normalized
 
-    st.subheader("Key Design Decisions")
-    st.markdown("""
-    | Decision | Choice | Why |
-    |---|---|---|
-    | Loss | InfoNCE (in-batch negatives) | Scales O(B²) without extra data; B-1 free negatives per step |
-    | Temperature | Learnable parameter | Adapts embedding sharpness; starts at 0.07, tuned by SGD |
-    | Normalization | L2 on output | Dot product = cosine similarity; FAISS InnerProduct correct |
-    | Tower architecture | MLP + LayerNorm + GELU | Stable training; GELU smoother than ReLU for dense inputs |
-    | Negative mining | Semi-hard (logged, not re-weighted) | Hard negs tracked for monitoring collapse |
-    | ANN | FAISS IVFFlat | 10-100x speedup vs exact at 95%+ recall |
-    | Evaluation | Temporal leave-one-out | Prevents future leakage; mirrors production A/B |
-    """)
+          InfoNCE Loss  (τ = learnable)
+       In-batch negatives: B-1 per positive
+
+  ─────────────── Inference ───────────────────
+  User query ──► UserTower ──► FAISS search ──► Top-K pins
+                                    ▲
+                         Item embeddings (pre-indexed)
+    """, language="text")
+
+    st.markdown("### Key Design Decisions")
+    decisions = {
+        "Loss Function": ("InfoNCE with in-batch negatives",
+                          "B−1 free negatives per step — scales without extra sampling"),
+        "Temperature τ": ("Learnable parameter (init 0.07)",
+                          "Self-calibrates embedding sharpness during training"),
+        "Output normalization": ("L2-norm on both towers",
+                                 "Dot product = cosine similarity; FAISS InnerProduct correct"),
+        "ANN Index": ("FAISS Flat (demo) / IVFFlat (prod)",
+                      "10-100× faster than exact; tune nprobe for recall-speed tradeoff"),
+        "Train/Val split": ("Temporal leave-one-out",
+                            "Prevents future leakage; mirrors real A/B test protocol"),
+    }
+
+    for decision, (choice, reason) in decisions.items():
+        with st.expander(f"**{decision}** → {choice}"):
+            st.markdown(f"*Why:* {reason}")
+
+# ─── Tab 4: Embedding Space ───────────────────────────────────────────────────
+with tab4:
+    st.subheader("🧪 Embedding Space Analysis")
+
+    # Cosine similarity heatmap: user vs top-8 pins
+    top8_ids = item_ids[:8]
+    top8_embs = item_embs[top8_ids].astype(np.float32)
+    # Normalize
+    top8_norm = top8_embs / (np.linalg.norm(top8_embs, axis=1, keepdims=True) + 1e-8)
+    u_norm = u_emb / (np.linalg.norm(u_emb) + 1e-8)
+    all_vecs = np.vstack([u_norm, top8_norm])
+    sim_mat = all_vecs @ all_vecs.T
+
+    labels = ["User"] + [
+        f"Pin#{i+1}\n{CATEGORY_EMOJIS.get(pin_df.iloc[int(iid)]['primary_category'], '')}"
+        for i, iid in enumerate(top8_ids) if int(iid) < len(pin_df)
+    ]
+
+    fig3, ax3 = plt.subplots(figsize=(8, 6))
+    sns.heatmap(
+        sim_mat, annot=True, fmt=".2f", cmap="RdYlGn",
+        xticklabels=labels, yticklabels=labels,
+        ax=ax3, vmin=-1, vmax=1, linewidths=0.5,
+    )
+    ax3.set_title("Cosine Similarity Matrix — User vs Top-8 Retrieved Pins",
+                  fontweight="bold", pad=12)
+    fig3.tight_layout()
+    st.pyplot(fig3, use_container_width=True)
+
+    st.info(
+        "**Reading this chart:** Values close to 1.0 (green) = highly similar in embedding space. "
+        "The user row shows how similar the query user is to each retrieved pin. "
+        "Pins similar to each other cluster together (same category pins should be green with each other)."
+    )
+
+    # Score distribution
+    st.markdown("### Score Distribution of Retrieved Pins")
+    fig4, ax4 = plt.subplots(figsize=(8, 3))
+    ax4.bar(range(1, len(scores) + 1), scores, color="#e60023", alpha=0.8)
+    ax4.set_xlabel("Rank")
+    ax4.set_ylabel("Cosine Similarity")
+    ax4.set_title("Similarity scores decay across ranks (expected behavior)")
+    ax4.spines[["top", "right"]].set_visible(False)
+    fig4.tight_layout()
+    st.pyplot(fig4, use_container_width=True)
+
+# ─── Footer ───────────────────────────────────────────────────────────────────
+st.divider()
+st.markdown(
+    "<center style='color:gray; font-size:0.8rem;'>"
+    "Pinterest Two-Tower Retrieval · Built with PyTorch + FAISS + Streamlit · "
+    "github.com/data-geek-astronomy/pinterest-two-tower"
+    "</center>",
+    unsafe_allow_html=True,
+)

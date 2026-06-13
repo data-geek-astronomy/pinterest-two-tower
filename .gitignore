@@ -6,12 +6,15 @@ __pycache__/
 venv/
 env/
 
-# Data & model artifacts
+# Data & model artifacts (regenerated on first run)
 data/raw/
 data/processed/
+demo_data/
+demo_models/
 *.pt
 *.pth
 *.index
+*.npy
 *.pkl
 
 # Streamlit

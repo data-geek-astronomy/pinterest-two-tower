@@ -1,0 +1,45 @@
+# ─── Demo Config (Streamlit Cloud) ──────────────────────────────────────────
+# Smaller than production config — trains in ~2-3 min on CPU
+data:
+  num_users: 2000
+  num_pins: 8000
+  num_boards: 4000
+  num_interactions: 60000
+  num_categories: 30
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  seed: 42
+
+model:
+  user_feature_dim: 64
+  item_feature_dim: 128
+  embedding_dim: 64
+  hidden_dims: [128, 64]
+  dropout: 0.2
+  temperature: 0.07
+
+training:
+  epochs: 8
+  batch_size: 256
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  num_negatives: 63
+  hard_negative_ratio: 0.3
+  patience: 3
+  grad_clip: 1.0
+
+faiss:
+  index_type: "Flat"
+  nlist: 50
+  nprobe: 5
+  top_k: 20
+
+evaluation:
+  k_values: [5, 10, 20]
+
+paths:
+  data_dir: "demo_data"
+  model_dir: "demo_models/checkpoints"
+  index_path: "demo_models/faiss.index"
+  embeddings_path: "demo_models/item_embeddings.npy"
