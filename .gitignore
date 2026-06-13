@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+env/
+
+# Data & model artifacts
+data/raw/
+data/processed/
+*.pt
+*.pth
+*.index
+*.pkl
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log

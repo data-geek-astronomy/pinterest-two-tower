@@ -1,0 +1,49 @@
+# ─── Data ───────────────────────────────────────────────────────────────────
+data:
+  num_users: 10000
+  num_pins: 50000
+  num_boards: 20000
+  num_interactions: 500000
+  num_categories: 30
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  seed: 42
+
+# ─── Model ──────────────────────────────────────────────────────────────────
+model:
+  user_feature_dim: 64      # input user feature dimension
+  item_feature_dim: 128     # input item feature dimension
+  embedding_dim: 64         # shared embedding space dimension
+  hidden_dims: [256, 128]   # MLP hidden layers
+  dropout: 0.2
+  temperature: 0.07         # InfoNCE temperature
+
+# ─── Training ───────────────────────────────────────────────────────────────
+training:
+  epochs: 30
+  batch_size: 512
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  num_negatives: 63         # in-batch negatives (batch_size - 1 effective)
+  hard_negative_ratio: 0.3  # fraction of hard negatives per batch
+  patience: 5               # early stopping patience
+  grad_clip: 1.0
+
+# ─── FAISS ──────────────────────────────────────────────────────────────────
+faiss:
+  index_type: "IVFFlat"     # IVFFlat for speed, Flat for exact
+  nlist: 100                # number of Voronoi cells
+  nprobe: 10                # cells to search at query time
+  top_k: 20
+
+# ─── Evaluation ─────────────────────────────────────────────────────────────
+evaluation:
+  k_values: [5, 10, 20]
+
+# ─── Paths ──────────────────────────────────────────────────────────────────
+paths:
+  data_dir: "data"
+  model_dir: "models/checkpoints"
+  index_path: "models/faiss.index"
+  embeddings_path: "models/item_embeddings.npy"
