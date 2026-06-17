@@ -1,3 +1,15 @@
+---
+title: Pinterest Two-Tower Retrieval
+emoji: 📌
+colorFrom: red
+colorTo: pink
+sdk: docker
+app_port: 7860
+pinned: true
+license: mit
+short_description: Two-Tower retrieval system for Pinterest-style personalization
+---
+
 # Pinterest Two-Tower Retrieval System
 
 A production-grade **Two-Tower (Dual Encoder)** retrieval system built to personalize Pinterest-style content feeds. Designed as an ML Engineer interview project demonstrating the full ML lifecycle from data generation to ANN-indexed inference.
